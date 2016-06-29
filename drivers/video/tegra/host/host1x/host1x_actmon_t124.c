@@ -198,13 +198,17 @@ static int host1x_actmon_init(struct host1x_actmon *actmon)
 	val |= actmon_ctrl_actmon_enable_f(1);
 	actmon_writel(actmon, val, actmon_ctrl_r());
 
-	/* setup watermark workers */
-	actmon->below_wmark_worker.actmon = actmon;
-	actmon->below_wmark_worker.type = ACTMON_INTR_BELOW_WMARK;
-	INIT_WORK(&actmon->below_wmark_worker.work, host1x_actmon_event_fn);
-	actmon->above_wmark_worker.actmon = actmon;
-	actmon->above_wmark_worker.type = ACTMON_INTR_ABOVE_WMARK;
-	INIT_WORK(&actmon->above_wmark_worker.work, host1x_actmon_event_fn);
+	if (engine_pdata->actmon_irq) {
+		/* setup watermark workers */
+		actmon->below_wmark_worker.actmon = actmon;
+		actmon->below_wmark_worker.type = ACTMON_INTR_BELOW_WMARK;
+		INIT_WORK(&actmon->below_wmark_worker.work,
+				host1x_actmon_event_fn);
+		actmon->above_wmark_worker.actmon = actmon;
+		actmon->above_wmark_worker.type = ACTMON_INTR_ABOVE_WMARK;
+		INIT_WORK(&actmon->above_wmark_worker.work,
+				host1x_actmon_event_fn);
+	}
 
 	nvhost_intr_enable_host_irq(&nvhost_get_host(host_pdev)->intr,
 				    engine_pdata->actmon_irq,
@@ -225,12 +229,18 @@ static void host1x_actmon_deinit(struct host1x_actmon *actmon)
 	if (actmon->init != ACTMON_READY)
 		return;
 
-	actmon->init = ACTMON_SLEEP;
-
 	actmon_writel(actmon, 0, actmon_ctrl_r());
 	actmon_writel(actmon, 0xffffffff, actmon_intr_status_r());
 	nvhost_intr_disable_host_irq(&nvhost_get_host(host_pdev)->intr,
 				     engine_pdata->actmon_irq);
+
+	/* wait for work to finish and then cancel*/
+	if (engine_pdata->actmon_irq) {
+		cancel_work_sync(&actmon->above_wmark_worker.work);
+		cancel_work_sync(&actmon->below_wmark_worker.work);
+	}
+
+	actmon->init = ACTMON_SLEEP;
 }
 
 static int host1x_actmon_avg(struct host1x_actmon *actmon, u32 *val)

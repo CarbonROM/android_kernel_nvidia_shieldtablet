@@ -1,7 +1,7 @@
 /*
  * GK20A Graphics
  *
- * Copyright (c) 2011-2015, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2016, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -189,6 +189,7 @@ struct gpu_ops {
 		void (*init_uncompressed_kind_map)(struct gk20a *g);
 		void (*init_kind_attr)(struct gk20a *g);
 		void (*set_mmu_page_size)(struct gk20a *g);
+		bool (*set_use_full_comp_tag_line)(struct gk20a *g);
 		int (*compression_page_size)(struct gk20a *g);
 		int (*compressible_page_size)(struct gk20a *g);
 		void (*dump_vpr_wpr_info)(struct gk20a *g);
@@ -473,6 +474,8 @@ struct gk20a {
 
 	u32 gr_idle_timeout_default;
 	u32 timeouts_enabled;
+
+	struct mutex poweroff_lock;
 
 	bool slcg_enabled;
 	bool blcg_enabled;

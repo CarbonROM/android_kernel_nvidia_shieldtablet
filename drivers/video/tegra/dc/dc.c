@@ -4,7 +4,7 @@
  * Copyright (C) 2010 Google, Inc.
  * Author: Erik Gilling <konkers@android.com>
  *
- * Copyright (c) 2010-2015, NVIDIA CORPORATION, All rights reserved.
+ * Copyright (c) 2010-2016, NVIDIA CORPORATION, All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -2191,6 +2191,14 @@ static void _tegra_dc_update_cmu(struct tegra_dc *dc, struct tegra_dc_cmu *cmu)
 	}
 }
 
+void _tegra_dc_cmu_enable(struct tegra_dc *dc, bool cmu_enable)
+{
+	dc->cmu_enabled = cmu_enable;
+	_tegra_dc_update_cmu(dc, tegra_dc_get_cmu(dc));
+	tegra_dc_set_color_control(dc);
+	tegra_dc_writel(dc, GENERAL_ACT_REQ, DC_CMD_STATE_CONTROL);
+}
+
 int tegra_dc_update_cmu(struct tegra_dc *dc, struct tegra_dc_cmu *cmu)
 {
 	mutex_lock(&dc->lock);
@@ -2211,38 +2219,6 @@ int tegra_dc_update_cmu(struct tegra_dc *dc, struct tegra_dc_cmu *cmu)
 	return 0;
 }
 EXPORT_SYMBOL(tegra_dc_update_cmu);
-
-int tegra_dc_set_hdr(struct tegra_dc *dc, struct tegra_dc_hdr *hdr,
-						bool cache_dirty)
-{
-	int ret;
-
-	mutex_lock(&dc->lock);
-
-	if (!dc->enabled) {
-		mutex_unlock(&dc->lock);
-		return 0;
-	}
-	if (cache_dirty) {
-		dc->hdr.eotf = hdr->eotf;
-		dc->hdr.static_metadata_id = hdr->static_metadata_id;
-		memcpy(dc->hdr.static_metadata, hdr->static_metadata,
-					sizeof(dc->hdr.static_metadata));
-	} else if (dc->hdr.enabled == hdr->enabled) {
-		mutex_unlock(&dc->lock);
-		return 0;
-	}
-	dc->hdr.enabled = hdr->enabled;
-	dc->hdr_cache_dirty = true;
-	if (!dc->hdr.enabled)
-		memset(&dc->hdr, 0, sizeof(dc->hdr));
-	ret = _tegra_dc_config_frame_end_intr(dc, true);
-
-	mutex_unlock(&dc->lock);
-
-	return ret;
-}
-EXPORT_SYMBOL(tegra_dc_set_hdr);
 
 static int _tegra_dc_update_cmu_aligned(struct tegra_dc *dc,
 				struct tegra_dc_cmu *cmu,
@@ -2276,8 +2252,41 @@ EXPORT_SYMBOL(tegra_dc_update_cmu_aligned);
 #define tegra_dc_cache_cmu(dc, src_cmu)
 #define tegra_dc_set_cmu(dc, cmu)
 #define tegra_dc_update_cmu(dc, cmu)
+#define _tegra_dc_enable_cmu(dc, cmu)
 #define tegra_dc_update_cmu_aligned(dc, cmu)
 #endif
+
+int tegra_dc_set_hdr(struct tegra_dc *dc, struct tegra_dc_hdr *hdr,
+						bool cache_dirty)
+{
+	int ret;
+
+	mutex_lock(&dc->lock);
+
+	if (!dc->enabled) {
+		mutex_unlock(&dc->lock);
+		return 0;
+	}
+	trace_hdr_data_update(dc, hdr);
+	if (cache_dirty) {
+		dc->hdr.eotf = hdr->eotf;
+		dc->hdr.static_metadata_id = hdr->static_metadata_id;
+		memcpy(dc->hdr.static_metadata, hdr->static_metadata,
+					sizeof(dc->hdr.static_metadata));
+	} else if (dc->hdr.enabled == hdr->enabled) {
+		mutex_unlock(&dc->lock);
+		return 0;
+	}
+	dc->hdr.enabled = hdr->enabled;
+	dc->hdr_cache_dirty = true;
+	if (!dc->hdr.enabled)
+		memset(&dc->hdr, 0, sizeof(dc->hdr));
+	ret = _tegra_dc_config_frame_end_intr(dc, true);
+
+	mutex_unlock(&dc->lock);
+	return ret;
+}
+EXPORT_SYMBOL(tegra_dc_set_hdr);
 
 /* disable_irq() blocks until handler completes, calling this function while
  * holding dc->lock can deadlock. */
@@ -2468,6 +2477,8 @@ void tegra_dc_set_out_pin_polars(struct tegra_dc *dc,
 
 static struct tegra_dc_mode *tegra_dc_get_override_mode(struct tegra_dc *dc)
 {
+	unsigned long refresh;
+
 	if (dc->out->type == TEGRA_DC_OUT_HDMI &&
 			tegra_is_bl_display_initialized(dc->ndev->id)) {
 
@@ -2507,6 +2518,24 @@ static struct tegra_dc_mode *tegra_dc_get_override_mode(struct tegra_dc *dc)
 		val = tegra_dc_readl(dc, DC_DISP_DISP_ACTIVE);
 		mode->h_active = val & 0xffff;
 		mode->v_active = (val >> 16) & 0xffff;
+
+		/* Check the freq setup by the BL, 59.94 or 60Hz
+		 * If 59.94, vmode needs to be FB_VMODE_1000DIV1001
+		 * for seamless
+		 */
+		refresh = tegra_dc_calc_refresh(mode);
+		if (refresh % 1000)
+			mode->vmode |= FB_VMODE_1000DIV1001;
+
+		/*
+		 * Implicit contract between BL and us. If CMU is enabled,
+		 * assume limited range. This sort of works because we know
+		 * BL doesn't support YUV
+		 */
+		val = tegra_dc_readl(dc, DC_DISP_DISP_COLOR_CONTROL);
+		if (val & CMU_ENABLE)
+			mode->vmode |= FB_VMODE_LIMITED_RANGE;
+
 		tegra_dc_put(dc);
 	}
 

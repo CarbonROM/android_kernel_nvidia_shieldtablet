@@ -1,7 +1,7 @@
 /*
  * drivers/video/tegra/dc/hdmi2.0.c
  *
- * Copyright (c) 2014-2015, NVIDIA CORPORATION, All rights reserved.
+ * Copyright (c) 2014-2016, NVIDIA CORPORATION, All rights reserved.
  * Author: Animesh Kishore <ankishore@nvidia.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -127,6 +127,8 @@ static void tegra_hdmi_config_clk(struct tegra_hdmi *hdmi, u32 clk_type);
 static long tegra_dc_hdmi_setup_clk(struct tegra_dc *dc, struct clk *clk);
 static void tegra_hdmi_scdc_worker(struct work_struct *work);
 static void tegra_hdmi_debugfs_init(struct tegra_hdmi *hdmi);
+static void tegra_hdmi_hdr_worker(struct work_struct *work);
+
 
 static inline bool tegra_hdmi_is_connected(struct tegra_hdmi *hdmi)
 {
@@ -340,6 +342,10 @@ static bool tegra_hdmi_fb_mode_filter(const struct tegra_dc *dc,
 		mode->vmode &= ~FB_VMODE_Y420;
 		mode->vmode |= FB_VMODE_Y420_ONLY;
 	}
+
+	if (mode->vmode & FB_VMODE_YUV_MASK &&
+		tegra_edid_get_quirks(hdmi->edid) & TEGRA_EDID_QUIRK_NO_YUV)
+		return false;
 
 	/*
 	 * There are currently many TVs in the market that actually do NOT support
@@ -572,14 +578,13 @@ static int tegra_hdmi_controller_disable(struct tegra_hdmi *hdmi)
 	struct tegra_dc *dc = hdmi->dc;
 
 	tegra_dc_get(dc);
-
 	tegra_nvhdcp_set_plug(hdmi->nvhdcp, 0);
 	tegra_dc_sor_detach(sor);
 	tegra_sor_power_lanes(sor, 4, false);
 	tegra_sor_hdmi_pad_power_down(sor);
 	tegra_hdmi_reset(hdmi);
 	tegra_hdmi_put(dc);
-
+	cancel_delayed_work_sync(&hdmi->hdr_worker);
 	tegra_dc_put(dc);
 
 	return 0;
@@ -840,6 +845,12 @@ static int tegra_hdmi_config_tmds(struct tegra_hdmi *hdmi)
 	return 0;
 }
 
+static int tegra_hdmi_hdr_init(struct tegra_hdmi *hdmi)
+{
+	INIT_DELAYED_WORK(&hdmi->hdr_worker, tegra_hdmi_hdr_worker);
+	return 0;
+}
+
 static int tegra_dc_hdmi_init(struct tegra_dc *dc)
 {
 	struct tegra_hdmi *hdmi;
@@ -922,6 +933,8 @@ static int tegra_dc_hdmi_init(struct tegra_dc *dc)
 	tegra_hdmi_tmds_init(hdmi);
 
 	tegra_dc_set_outdata(dc, hdmi);
+
+	tegra_hdmi_hdr_init(hdmi);
 
 	/* NOTE: Below code is applicable to L4T or embedded systems and is
 	 * protected accordingly. This section early enables DC with first mode
@@ -1022,7 +1035,11 @@ static void tegra_hdmi_config(struct tegra_hdmi *hdmi)
 			NV_SOR_REFCLK_DIV_INT(dispclk_div_8_2 >> 2) |
 			NV_SOR_REFCLK_DIV_FRAC(dispclk_div_8_2));
 
-	rekey = NV_SOR_HDMI_CTRL_REKEY_DEFAULT;
+	/*
+	 * The rekey register and corresponding eq want to operate
+	 * on "-2" of the desired rekey value
+	 */
+	rekey = NV_SOR_HDMI_CTRL_REKEY_DEFAULT - 2;
 	hblank = dc->mode.h_sync_width + dc->mode.h_back_porch +
 			dc->mode.h_front_porch;
 	max_ac = (hblank - rekey - 18) / 32;
@@ -1030,7 +1047,7 @@ static void tegra_hdmi_config(struct tegra_hdmi *hdmi)
 	val = 0;
 	val |= hdmi->dvi ? 0x0 : NV_SOR_HDMI_CTRL_ENABLE;
 	/* The register wants "-2" of the required rekey val */
-	val |= NV_SOR_HDMI_CTRL_REKEY(rekey - 2);
+	val |= NV_SOR_HDMI_CTRL_REKEY(rekey);
 	val |= NV_SOR_HDMI_CTRL_MAX_AC_PACKET(max_ac);
 	val |= NV_SOR_HDMI_CTRL_AUDIO_LAYOUT_SELECT;
 	tegra_sor_writel(sor, NV_SOR_HDMI_CTRL, val);
@@ -1117,11 +1134,6 @@ static void tegra_hdmi_get_cea_fb_videomode(struct fb_videomode *m,
 		dc_mode.pclk = (dc_mode.pclk / 5) * 8;
 	}
 
-	if (dc_mode.vmode & FB_VMODE_1000DIV1001) {
-		dc_mode.pclk = DIV_ROUND_UP((u64)dc_mode.pclk * 1001,  1000);
-		dc_mode.vmode &= ~FB_VMODE_1000DIV1001;
-	}
-
 	tegra_dc_to_fb_videomode(m, &dc_mode);
 
 	/* only interlaced required for VIC identification */
@@ -1153,22 +1165,7 @@ static int tegra_hdmi_find_cea_vic(struct tegra_hdmi *hdmi)
 	for (i = 1; i < modedb_size; i++) {
 		const struct fb_videomode *curr = &cea_modes[i];
 
-		if (!((m.refresh == curr->refresh ||
-		       m.refresh + 1 == curr->refresh ||
-		       m.refresh == curr->refresh + 1) &&
-		      m.xres         == curr->xres &&
-		      m.yres         == curr->yres &&
-		      (m.pixclock    == curr->pixclock ||
-		      (m.pixclock * 1001 / 1000) == curr->pixclock) &&
-		      m.hsync_len    == curr->hsync_len &&
-		      m.vsync_len    == curr->vsync_len &&
-		      m.left_margin  == curr->left_margin &&
-		      m.right_margin == curr->right_margin &&
-		      m.upper_margin == curr->upper_margin &&
-		      m.lower_margin == curr->lower_margin &&
-		      m.sync         == curr->sync &&
-		      m.flag         == curr->flag &&
-		      m.vmode        == curr->vmode))
+		if (!fb_mode_is_equal_tolerance(curr, &m, 5))
 			continue;
 
 		if (!best)
@@ -1264,6 +1261,8 @@ static u32 tegra_hdmi_get_rgb_ycc(struct tegra_hdmi *hdmi)
 		return HDMI_AVI_YCC_420;
 	else if (yuv_flag & FB_VMODE_Y422)
 		return HDMI_AVI_YCC_422;
+	else if (yuv_flag & FB_VMODE_Y444)
+		return HDMI_AVI_YCC_444;
 
 	return HDMI_AVI_RGB;
 }
@@ -1282,6 +1281,36 @@ static u32 tegra_hdmi_get_ex_colorimetry(struct tegra_hdmi *hdmi)
 		HDMI_AVI_EXT_COLORIMETRY_INVALID;
 }
 
+static u32 tegra_hdmi_get_rgb_quant(struct tegra_hdmi *hdmi)
+{
+	u32 vmode = hdmi->dc->mode.vmode;
+
+	if (tegra_edid_get_quant_cap(hdmi->edid) & FB_CAP_RGB_QUANT_SELECTABLE)
+		return vmode & FB_VMODE_LIMITED_RANGE ?
+			HDMI_AVI_RGB_QUANT_LIMITED : HDMI_AVI_RGB_QUANT_FULL;
+	else
+		/*
+		 * The safest way to break the HDMI spec when forcing full range
+		 * on a limited system: send full data with the QUANT_DEFAULT
+		 * */
+		return HDMI_AVI_RGB_QUANT_DEFAULT;
+}
+
+static u32 tegra_hdmi_get_ycc_quant(struct tegra_hdmi *hdmi)
+{
+	u32 vmode = hdmi->dc->mode.vmode;
+
+	if (tegra_edid_get_quant_cap(hdmi->edid) & FB_CAP_YUV_QUANT_SELECTABLE)
+		return vmode & FB_VMODE_LIMITED_RANGE ?
+			HDMI_AVI_YCC_QUANT_LIMITED : HDMI_AVI_YCC_QUANT_FULL;
+	else
+		/*
+		 * The safest way to break the HDMI spec when forcing full range
+		 * on a limited system: send full data with the QUANT_DEFAULT
+		 * */
+		return HDMI_AVI_YCC_QUANT_NONE;
+}
+
 static void tegra_hdmi_avi_infoframe_update(struct tegra_hdmi *hdmi)
 {
 	struct hdmi_avi_infoframe *avi = &hdmi->avi;
@@ -1293,7 +1322,7 @@ static void tegra_hdmi_avi_infoframe_update(struct tegra_hdmi *hdmi)
 
 	avi->scan = HDMI_AVI_UNDERSCAN;
 	avi->bar_valid = HDMI_AVI_BAR_INVALID;
-	avi->act_fmt_valid = HDMI_AVI_ACTIVE_FORMAT_VALID;
+	avi->act_fmt_valid = HDMI_AVI_ACTIVE_FORMAT_INVALID;
 	avi->rgb_ycc = tegra_hdmi_get_rgb_ycc(hdmi);
 
 	avi->act_format = HDMI_AVI_ACTIVE_FORMAT_SAME;
@@ -1303,7 +1332,7 @@ static void tegra_hdmi_avi_infoframe_update(struct tegra_hdmi *hdmi)
 			HDMI_AVI_COLORIMETRY_DEFAULT;
 
 	avi->scaling = HDMI_AVI_SCALING_UNKNOWN;
-	avi->rgb_quant = HDMI_AVI_RGB_QUANT_DEFAULT;
+	avi->rgb_quant = tegra_hdmi_get_rgb_quant(hdmi);
 	avi->ext_colorimetry = tegra_hdmi_get_ex_colorimetry(hdmi);
 	avi->it_content = HDMI_AVI_IT_CONTENT_FALSE;
 
@@ -1312,7 +1341,7 @@ static void tegra_hdmi_avi_infoframe_update(struct tegra_hdmi *hdmi)
 
 	avi->pix_rep = HDMI_AVI_NO_PIX_REPEAT;
 	avi->it_content_type = HDMI_AVI_IT_CONTENT_NONE;
-	avi->ycc_quant = HDMI_AVI_YCC_QUANT_NONE;
+	avi->ycc_quant = tegra_hdmi_get_ycc_quant(hdmi);
 
 	avi->top_bar_end_line_low_byte = 0;
 	avi->top_bar_end_line_high_byte = 0;
@@ -1361,18 +1390,9 @@ static void tegra_hdmi_avi_infoframe(struct tegra_hdmi *hdmi)
 static int tegra_hdmi_get_extended_vic(const struct tegra_dc_mode *mode)
 {
 	struct fb_videomode m;
-	struct tegra_dc_mode mode_fixed;
 	unsigned i;
 
-	mode_fixed = *mode;
-
-	if (mode_fixed.vmode & FB_VMODE_1000DIV1001) {
-		mode_fixed.pclk = DIV_ROUND_UP((u64)mode_fixed.pclk * 1001,
-							1000);
-		mode_fixed.vmode &= ~FB_VMODE_1000DIV1001;
-	}
-
-	tegra_dc_to_fb_videomode(&m, &mode_fixed);
+	tegra_dc_to_fb_videomode(&m, mode);
 
 	/* only interlaced required for VIC identification */
 	m.vmode &= FB_VMODE_INTERLACED;
@@ -1380,28 +1400,7 @@ static int tegra_hdmi_get_extended_vic(const struct tegra_dc_mode *mode)
 	for (i = 1; i < HDMI_EXT_MODEDB_SIZE; i++) {
 		const struct fb_videomode *curr = &hdmi_ext_modes[i];
 
-		/*
-		 * We have to make sure we explicitly don't check m.refresh ==
-		 * curr->refresh (or use the fb_mode_is_equal() which does this
-		 * check). This is because of the lack of accuracy when going
-		 * between fb_videomode -> tegra_dc_mode -> fb_videomode. For
-		 * 1000/1001 modes, the calculated m->refresh is actually not
-		 * accurate. This is honestly a hack and does need to be fixed,
-		 * but is a WAR for now for HDMI certification
-		 */
-		if ((m.refresh == curr->refresh ||
-		     m.refresh + 1 == curr->refresh) &&
-		    m.xres         == curr->xres &&
-		    m.yres         == curr->yres &&
-		    m.pixclock     == curr->pixclock &&
-		    m.hsync_len    == curr->hsync_len &&
-		    m.vsync_len    == curr->vsync_len &&
-		    m.left_margin  == curr->left_margin &&
-		    m.right_margin == curr->right_margin &&
-		    m.upper_margin == curr->upper_margin &&
-		    m.lower_margin == curr->lower_margin &&
-		    m.sync         == curr->sync &&
-		    m.vmode        == curr->vmode)
+		if (fb_mode_is_equal_tolerance(curr, &m, 5))
 			return i;
 	}
 	return 0;
@@ -1515,6 +1514,11 @@ static void tegra_hdmi_hdr_infoframe(struct tegra_hdmi *hdmi)
 {
 	struct tegra_dc_sor_data *sor = hdmi->sor;
 
+	/* set_bits = contains all the bits to be set
+	 * for NV_SOR_HDMI_GENERIC_CTRL reg */
+	u32 set_bits = (NV_SOR_HDMI_GENERIC_CTRL_ENABLE_YES |
+			NV_SOR_HDMI_GENERIC_CTRL_AUDIO_ENABLE);
+
 	/* disable generic infoframe before configuring */
 	tegra_sor_writel(sor, NV_SOR_HDMI_GENERIC_CTRL, 0);
 
@@ -1527,11 +1531,9 @@ static void tegra_hdmi_hdr_infoframe(struct tegra_hdmi *hdmi)
 					&hdmi->hdr, sizeof(hdmi->hdr),
 					true);
 
-	/* Send infoframe every frame, checksum hw generated */
-	tegra_sor_writel(sor, NV_SOR_HDMI_GENERIC_CTRL,
-		NV_SOR_HDMI_GENERIC_CTRL_ENABLE_YES |
-		NV_SOR_HDMI_GENERIC_CTRL_OTHER_DISABLE |
-		NV_SOR_HDMI_GENERIC_CTRL_SINGLE_DISABLE);
+	/* set the required bits in NV_SOR_HDMI_GENERIC_CTRL*/
+	tegra_sor_writel(sor, NV_SOR_HDMI_GENERIC_CTRL, set_bits);
+
 	return;
 }
 
@@ -1728,10 +1730,15 @@ static inline u32 tegra_hdmi_get_bpp(struct tegra_hdmi *hdmi)
 {
 	int yuv_flag = hdmi->dc->mode.vmode & FB_VMODE_YUV_MASK;
 
-	if (yuv_flag == (FB_VMODE_Y420 | FB_VMODE_Y30))
+	if ((yuv_flag == (FB_VMODE_Y420 | FB_VMODE_Y30)) ||
+		(!(yuv_flag & YUV_MASK) && (yuv_flag == FB_VMODE_Y30)))
 		return 30;
-
-	return 24;
+	else if (!(yuv_flag & YUV_MASK) && (yuv_flag == FB_VMODE_Y36))
+		return 36;
+	else if (yuv_flag == (FB_VMODE_Y422 | FB_VMODE_Y36))
+		return 24;
+	else
+		return 0;
 }
 
 static u32 tegra_hdmi_gcp_color_depth(struct tegra_hdmi *hdmi)
@@ -1739,9 +1746,11 @@ static u32 tegra_hdmi_gcp_color_depth(struct tegra_hdmi *hdmi)
 	u32 gcp_cd = 0;
 
 	switch (tegra_hdmi_get_bpp(hdmi)) {
-	case 0: /* fall through */
-	case 24:
+	case 0:
 		gcp_cd = TEGRA_HDMI_BPP_UNKNOWN;
+		break;
+	case 24:
+		gcp_cd = TEGRA_HDMI_BPP_24;
 		break;
 	case 30:
 		gcp_cd = TEGRA_HDMI_BPP_30;
@@ -1768,11 +1777,10 @@ static u32 tegra_hdmi_gcp_packing_phase(struct tegra_hdmi *hdmi)
 	if (!tegra_hdmi_gcp_color_depth(hdmi))
 		return 0;
 
-	/* 10P4 for yuv420 10bpc */
-	if (yuv_flag == (FB_VMODE_Y420 | FB_VMODE_Y30))
+	if (!(yuv_flag & YUV_MASK) && (yuv_flag == FB_VMODE_Y36))
+		return 2;
+	else
 		return 0;
-
-	 return 0;
 }
 
 static bool tegra_hdmi_gcp_default_phase_en(struct tegra_hdmi *hdmi)
@@ -1782,10 +1790,11 @@ static bool tegra_hdmi_gcp_default_phase_en(struct tegra_hdmi *hdmi)
 	if (!tegra_hdmi_gcp_color_depth(hdmi))
 		return false;
 
-	if (yuv_flag == (FB_VMODE_Y420 | FB_VMODE_Y30))
+	if ((yuv_flag == (FB_VMODE_Y420 | FB_VMODE_Y30)) ||
+			(!(yuv_flag & YUV_MASK) && (yuv_flag == FB_VMODE_Y36)))
 		return true;
-
-	return false;
+	else
+		return false;
 }
 
 /* general control packet */
@@ -1838,9 +1847,7 @@ static int tegra_hdmi_controller_enable(struct tegra_hdmi *hdmi)
 
 	tegra_hdmi_config_clk(hdmi, TEGRA_HDMI_BRICK_CLK);
 	tegra_dc_sor_attach(sor);
-
-	if (!hdmi->dvi)
-		tegra_nvhdcp_set_plug(hdmi->nvhdcp, true);
+	tegra_nvhdcp_set_plug(hdmi->nvhdcp, true);
 
 	tegra_dc_setup_clk(dc, dc->clk);
 	tegra_dc_hdmi_setup_clk(dc, hdmi->sor->sor_clk);
@@ -1908,8 +1915,8 @@ static void tegra_hdmi_config_clk(struct tegra_hdmi *hdmi, u32 clk_type)
 			clk_get_rate(clk_get_parent(sor->src_switch_clk));
 
 		/* Set sor divider */
-		if (rate != parent_rate / div) {
-			rate = parent_rate / div;
+		if (rate != DIV_ROUND_UP(parent_rate, div)) {
+			rate = DIV_ROUND_UP(parent_rate, div);
 			clk_set_rate(sor->src_switch_clk, rate);
 		}
 
@@ -1989,6 +1996,35 @@ static long tegra_dc_hdmi_setup_clk(struct tegra_dc *dc, struct clk *clk)
 #endif
 
 	dc->mode.pclk = tegra_hdmi_get_pclk(&dc->mode);
+
+	if (dc->mode.h_front_porch == 48 &&
+		dc->mode.h_active == 1920 &&
+		dc->mode.pclk == 138652800 &&
+		dc->mode.h_back_porch == 80 &&
+		dc->mode.v_sync_width == 5 &&
+		dc->mode.h_sync_width == 32 &&
+		dc->mode.stereo_mode == 0 &&
+		dc->mode.v_back_porch == 23 &&
+		dc->mode.v_active == 1080 &&
+		dc->mode.v_front_porch == 3 &&
+		dc->mode.vmode & FB_VMODE_IS_DETAILED) {
+		if (tegra_edid_get_quirks(dc->edid) & TEGRA_EDID_QUIRK_FIX_138_50_MHZ)
+			dc->mode.pclk = 138500000;
+		else if (tegra_edid_get_quirks(dc->edid) & TEGRA_EDID_QUIRK_FIX_138_65_MHZ)
+			dc->mode.pclk = 138650000;
+	} else if (dc->mode.h_front_porch == 111 &&
+		dc->mode.h_active == 1280 &&
+		dc->mode.pclk == 74349000 &&
+		dc->mode.h_back_porch == 219 &&
+		dc->mode.v_sync_width == 5 &&
+		dc->mode.h_sync_width == 40 &&
+		dc->mode.stereo_mode == 0 &&
+		dc->mode.v_back_porch == 21 &&
+		dc->mode.v_active == 720 &&
+		dc->mode.v_front_porch == 5 &&
+		dc->mode.vmode & FB_VMODE_IS_DETAILED) {
+		dc->mode.pclk = 74250000;
+	}
 
 	if (IS_ERR_OR_NULL(parent_clk)) {
 		dev_err(&dc->ndev->dev, "hdmi: parent clk get failed\n");
@@ -2129,10 +2165,52 @@ static int tegra_dc_hdmi_set_hdr(struct tegra_dc *dc)
 {
 	u16 ret = 0;
 	struct tegra_hdmi *hdmi = tegra_dc_get_outdata(dc);
+
+	/* If the sink isn't HDR capable, return */
 	ret = tegra_edid_get_ex_hdr_cap(hdmi->edid);
-	if (ret & FB_CAP_HDR)
-		tegra_hdmi_hdr_infoframe(hdmi);
+	if (!(ret & FB_CAP_HDR))
+		return 0;
+
+	/* Cancel any pending hdr-exit work */
+	if (dc->hdr.enabled)
+		cancel_delayed_work_sync(&hdmi->hdr_worker);
+
+	tegra_hdmi_hdr_infoframe(hdmi);
+
+	/*
+	 *If hdr is disabled then send HDR infoframe for
+	 *2 secs with SDR eotf and then stop
+	 */
+	if (dc->hdr.enabled)
+		return 0;
+
+	schedule_delayed_work(&hdmi->hdr_worker,
+		msecs_to_jiffies(HDMI_HDR_INFOFRAME_STOP_TIMEOUT_MS));
+
 	return 0;
+}
+
+static void tegra_hdmi_hdr_worker(struct work_struct *work)
+{
+	u32 val = 0;
+	struct tegra_hdmi *hdmi = container_of(to_delayed_work(work),
+				struct tegra_hdmi, hdr_worker);
+
+	if (hdmi && hdmi->enabled) {
+		/* If hdr re-enabled within 2s, return.
+		 * Note this an extra safety check since
+		 * we should have already cancelled this work */
+		if (hdmi->dc->hdr.enabled)
+			return;
+		/* Read the current regsiter value to restore the bits */
+		val = tegra_sor_readl(hdmi->sor, NV_SOR_HDMI_GENERIC_CTRL);
+
+		/* Set val to disable generic infoframe */
+		val &= ~NV_SOR_HDMI_GENERIC_CTRL_ENABLE_YES;
+
+		tegra_sor_writel(hdmi->sor, NV_SOR_HDMI_GENERIC_CTRL, val);
+	}
+	return;
 }
 
 static int tegra_dc_hdmi_ddc_enable(struct tegra_dc *dc)
@@ -2166,6 +2244,10 @@ static void tegra_dc_hdmi_modeset_notifier(struct tegra_dc *dc)
 			tegra_hdmi_v2_x_mon_config(hdmi, false);
 		tegra_hdmi_v2_x_host_config(hdmi, false);
 	}
+
+	if (!(dc->mode.vmode & FB_VMODE_SET_YUV_MASK))
+		_tegra_dc_cmu_enable(dc,
+			dc->mode.vmode & FB_VMODE_LIMITED_RANGE);
 
 	tegra_dc_io_end(dc);
 	tegra_hdmi_put(dc);

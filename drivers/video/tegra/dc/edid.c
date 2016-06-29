@@ -4,7 +4,7 @@
  * Copyright (C) 2010 Google, Inc.
  * Author: Erik Gilling <konkers@android.com>
  *
- * Copyright (c) 2010-2015, NVIDIA CORPORATION, All rights reserved.
+ * Copyright (c) 2010-2016, NVIDIA CORPORATION, All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -38,6 +38,10 @@ struct tegra_edid_pvt {
 	bool				scdc_present;
 	bool				db420_present;
 	bool				hfvsdb_present;
+	bool				rgb_quant_selectable;
+	bool				yuv_quant_selectable;
+	bool				support_yuv422;
+	bool				support_yuv444;
 	int			        hdmi_vic_len;
 	u8			        hdmi_vic[7];
 	u16			color_depth_flag;
@@ -52,6 +56,7 @@ struct tegra_edid_pvt {
 	u16			hdr_desired_max_luma;
 	u16			hdr_desired_max_frame_avg_luma;
 	u16			hdr_desired_min_luma;
+	u32			quirks;
 	/* Note: dc_edid must remain the last member */
 	struct tegra_dc_edid		dc_edid;
 };
@@ -321,6 +326,15 @@ static int tegra_edid_parse_ext_block(const u8 *raw, int idx,
 	else
 		edid->support_underscan = 0;
 
+	if (raw[3] & (1<<5))
+		edid->support_yuv444 = 1;
+	else
+		edid->support_yuv444 = 0;
+
+	if (raw[3] & (1<<4))
+		edid->support_yuv422 = 1;
+	else
+		edid->support_yuv422 = 0;
 	ptr = &raw[4];
 
 	while (ptr < &raw[idx]) {
@@ -357,14 +371,22 @@ static int tegra_edid_parse_ext_block(const u8 *raw, int idx,
 		case CEA_DATA_BLOCK_VENDOR:
 		{
 			int j = 0;
-
+			u16 temp = 0;
 			/* OUI for hdmi licensing, LLC */
 			if ((ptr[1] == 0x03) &&
 				(ptr[2] == 0x0c) &&
 				(ptr[3] == 0)) {
 				edid->eld.port_id[0] = ptr[4];
 				edid->eld.port_id[1] = ptr[5];
-
+				temp = ptr[6];
+				edid->color_depth_flag = (temp << 5) &
+							TEGRA_DC_RGB_MASK;
+				if (edid->support_yuv422 && (temp & 0x08))
+					edid->color_depth_flag |= (temp >> 1) &
+							TEGRA_DC_Y422_MASK;
+				if (edid->support_yuv444 && (temp & 0x08))
+					edid->color_depth_flag |= (temp << 2) &
+							TEGRA_DC_Y444_MASK;
 				if (len >= 7)
 					edid->max_tmds_char_rate_hllc_mhz =
 								ptr[7] * 5;
@@ -378,7 +400,7 @@ static int tegra_edid_parse_ext_block(const u8 *raw, int idx,
 				(ptr[2] == 0x5d) &&
 				(ptr[3] == 0xc4)) {
 				edid->hfvsdb_present = true;
-				edid->color_depth_flag = ptr[7] &
+				edid->color_depth_flag |= ptr[7] &
 							TEGRA_DC_Y420_MASK;
 				edid->max_tmds_char_rate_hf_mhz = ptr[5] * 5;
 				edid->scdc_present = (ptr[6] >> 7) & 0x1;
@@ -450,6 +472,10 @@ static int tegra_edid_parse_ext_block(const u8 *raw, int idx,
 			u8 ext_db = ptr[1];
 
 			switch (ext_db) {
+			case CEA_DATA_BLOCK_EXT_VCDB:
+				edid->rgb_quant_selectable = ptr[2] & 0x40;
+				edid->yuv_quant_selectable = ptr[2] & 0x80;
+				break;
 			case CEA_DATA_BLOCK_EXT_Y420VDB: /* fall through */
 			case CEA_DATA_BLOCK_EXT_Y420CMDB:
 				edid->db420_present = true;
@@ -459,7 +485,7 @@ static int tegra_edid_parse_ext_block(const u8 *raw, int idx,
 				break;
 			case CEA_DATA_BLOCK_EXT_HDR:
 				edid->hdr_pckt_len = ptr[0] & 0x0f;
-				edid->hdr_present = true;
+				edid->hdr_present = ptr[2] & 0x04;
 				edid->hdr_eotf = ptr[2];
 				edid->hdr_static_metadata = ptr[3];
 				if (edid->hdr_pckt_len > 5) {
@@ -537,6 +563,24 @@ u16 tegra_edid_get_ex_hdr_cap(struct tegra_edid *edid)
 	return ret;
 }
 
+u16 tegra_edid_get_quant_cap(struct tegra_edid *edid)
+{
+	u16 ret = 0;
+
+	if (!edid || !edid->data) {
+		pr_warn("edid invalid\n");
+		return 0;
+	}
+
+	if (edid->data->rgb_quant_selectable)
+		ret |= FB_CAP_RGB_QUANT_SELECTABLE;
+
+	if (edid->data->yuv_quant_selectable)
+		ret |= FB_CAP_YUV_QUANT_SELECTABLE;
+
+	return ret;
+}
+
 /* hdmi spec mandates sink to specify correct max_tmds_clk only for >165MHz */
 u16 tegra_edid_get_max_clk_rate(struct tegra_edid *edid)
 {
@@ -595,6 +639,16 @@ bool tegra_edid_is_420db_present(struct tegra_edid *edid)
 	return edid->data->db420_present;
 }
 
+u32 tegra_edid_get_quirks(struct tegra_edid *edid)
+{
+	if (!edid || !edid->data) {
+		pr_warn("edid invalid\n");
+		return false;
+	}
+
+	return edid->data->quirks;
+}
+
 u16 tegra_edid_get_ex_colorimetry(struct tegra_edid *edid)
 {
 	if (!edid || !edid->data) {
@@ -603,6 +657,26 @@ u16 tegra_edid_get_ex_colorimetry(struct tegra_edid *edid)
 	}
 
 	return edid->data->colorimetry;
+}
+
+bool tegra_edid_support_yuv422(struct tegra_edid *edid)
+{
+	if (!edid || !edid->data) {
+		pr_warn("edid invalid\n");
+		return 0;
+	}
+
+	return edid->data->support_yuv422;
+}
+
+bool tegra_edid_support_yuv444(struct tegra_edid *edid)
+{
+	if (!edid || !edid->data) {
+		pr_warn("edid invalid\n");
+		return 0;
+	}
+
+	return edid->data->support_yuv444;
 }
 
 int tegra_edid_get_monspecs(struct tegra_edid *edid, struct fb_monspecs *specs)
@@ -661,6 +735,8 @@ int tegra_edid_get_monspecs(struct tegra_edid *edid, struct fb_monspecs *specs)
 	new_data->eld.product_id[1] = data[0x9];
 	new_data->eld.manufacture_id[0] = data[0xA];
 	new_data->eld.manufacture_id[1] = data[0xB];
+	new_data->quirks = tegra_edid_lookup_quirks(specs->manufacturer,
+		specs->model, specs->monitor);
 
 	extension_blocks = data[0x7e];
 
@@ -769,7 +845,7 @@ int tegra_edid_get_monspecs(struct tegra_edid *edid, struct fb_monspecs *specs)
 				    (rate > (60000 - 20) && rate < (60000 + 20))) &&
 				    frac_n < max_modes) {
 					memcpy(&frac_modes[frac_n], &specs->modedb[j], sizeof(struct fb_videomode));
-					frac_modes[frac_n].pixclock = frac_modes[frac_n].pixclock * 1000 / 1001;
+					frac_modes[frac_n].pixclock = frac_modes[frac_n].pixclock * 1001 / 1000;
 					frac_modes[frac_n].vmode |= FB_VMODE_1000DIV1001;
 					frac_n++;
 				}
@@ -791,6 +867,17 @@ int tegra_edid_get_monspecs(struct tegra_edid *edid, struct fb_monspecs *specs)
 		}
 	}
 #endif
+
+	for (j = 0; j < specs->modedb_len; j++) {
+		if (!new_data->rgb_quant_selectable &&
+		    !(specs->modedb[j].vmode & FB_VMODE_SET_YUV_MASK))
+			specs->modedb[j].vmode |= FB_VMODE_LIMITED_RANGE;
+
+		if (!new_data->yuv_quant_selectable &&
+		    (specs->modedb[j].vmode & FB_VMODE_SET_YUV_MASK))
+			specs->modedb[j].vmode |= FB_VMODE_LIMITED_RANGE;
+	}
+
 	if (use_fallback)
 		edid->errors |= EDID_ERRORS_USING_FALLBACK;
 
